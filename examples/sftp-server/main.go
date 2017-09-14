@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/user"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -74,7 +75,8 @@ func main() {
 
 	// Before use, a handshake must be performed on the incoming
 	// net.Conn.
-	_, chans, reqs, err := ssh.NewServerConn(nConn, config)
+	sConn, chans, reqs, err := ssh.NewServerConn(nConn, config)
+	sConn.User()
 	if err != nil {
 		log.Fatal("failed to handshake", err)
 	}
@@ -119,8 +121,13 @@ func main() {
 			}
 		}(requests)
 
+		usr, err := user.Current()
+		if err != nil {
+			log.Fatal(err)
+		}
 		serverOptions := []sftp.ServerOption{
 			sftp.WithDebug(debugStream),
+			sftp.Chroot(usr.HomeDir),
 		}
 
 		if readOnly {

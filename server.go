@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -34,6 +35,7 @@ type Server struct {
 	openFilesLock sync.RWMutex
 	handleCount   int
 	maxTxPacket   uint32
+	chroot        *string
 }
 
 func (svr *Server) nextHandle(f *os.File) string {
@@ -109,6 +111,21 @@ func WithDebug(w io.Writer) ServerOption {
 	}
 }
 
+// Chroot sets chroot directory
+func Chroot(dir string) ServerOption {
+	return func(s *Server) error {
+		if dir != "" {
+			path := cleanPath(dir)
+			path, _ = filepath.Abs(path)
+			if strings.HasSuffix(path, "/") {
+				path = path[:len(path)-1]
+			}
+			s.chroot = &path
+		}
+		return nil
+	}
+}
+
 // ReadOnly configures a Server to serve files in read-only mode.
 func ReadOnly() ServerOption {
 	return func(s *Server) error {
@@ -153,13 +170,32 @@ func (svr *Server) sftpServerWorker(pktChan chan requestPacket) error {
 	return nil
 }
 
+func (s *Server) realPath(path string) string {
+	if s.chroot != nil {
+		path = filepath.Join(*s.chroot, path)
+	}
+	return path
+}
+
+func (s *Server) chrootPath(path string) string {
+	if s.chroot != nil {
+		if len(path) >= len(*s.chroot) && path[:len(*s.chroot)] == *s.chroot {
+			path = path[len(*s.chroot):]
+		}
+		if path == "" {
+			path = string(filepath.Separator)
+		}
+	}
+	return path
+}
+
 func handlePacket(s *Server, p interface{}) error {
 	switch p := p.(type) {
 	case *sshFxInitPacket:
 		return s.sendPacket(sshFxVersionPacket{sftpProtocolVersion, nil})
 	case *sshFxpStatPacket:
 		// stat the requested file
-		info, err := os.Stat(p.Path)
+		info, err := os.Stat(s.realPath(p.Path))
 		if err != nil {
 			return s.sendError(p, err)
 		}
@@ -169,7 +205,7 @@ func handlePacket(s *Server, p interface{}) error {
 		})
 	case *sshFxpLstatPacket:
 		// stat the requested file
-		info, err := os.Lstat(p.Path)
+		info, err := os.Lstat(s.realPath(p.Path))
 		if err != nil {
 			return s.sendError(p, err)
 		}
@@ -194,24 +230,24 @@ func handlePacket(s *Server, p interface{}) error {
 		})
 	case *sshFxpMkdirPacket:
 		// TODO FIXME: ignore flags field
-		err := os.Mkdir(p.Path, 0755)
+		err := os.Mkdir(s.realPath(p.Path), 0755)
 		return s.sendError(p, err)
 	case *sshFxpRmdirPacket:
-		err := os.Remove(p.Path)
+		err := os.Remove(s.realPath(p.Path))
 		return s.sendError(p, err)
 	case *sshFxpRemovePacket:
-		err := os.Remove(p.Filename)
+		err := os.Remove(s.realPath(p.Filename))
 		return s.sendError(p, err)
 	case *sshFxpRenamePacket:
-		err := os.Rename(p.Oldpath, p.Newpath)
+		err := os.Rename(s.realPath(p.Oldpath), s.realPath(p.Newpath))
 		return s.sendError(p, err)
 	case *sshFxpSymlinkPacket:
-		err := os.Symlink(p.Targetpath, p.Linkpath)
+		err := os.Symlink(s.realPath(p.Targetpath), s.realPath(p.Linkpath))
 		return s.sendError(p, err)
 	case *sshFxpClosePacket:
 		return s.sendError(p, s.closeHandle(p.Handle))
 	case *sshFxpReadlinkPacket:
-		f, err := os.Readlink(p.Path)
+		f, err := os.Readlink(s.realPath(p.Path))
 		if err != nil {
 			return s.sendError(p, err)
 		}
@@ -226,11 +262,12 @@ func handlePacket(s *Server, p interface{}) error {
 		})
 
 	case *sshFxpRealpathPacket:
-		f, err := filepath.Abs(p.Path)
+		f, err := filepath.Abs(s.realPath(p.Path))
 		if err != nil {
 			return s.sendError(p, err)
 		}
 		f = cleanPath(f)
+		f = s.chrootPath(f)
 		return s.sendPacket(sshFxpNamePacket{
 			ID: p.ID,
 			NameAttrs: []sshFxpNameAttr{{
@@ -397,7 +434,7 @@ func (p sshFxpOpenPacket) respond(svr *Server) error {
 		osFlags |= os.O_EXCL
 	}
 
-	f, err := os.OpenFile(p.Path, osFlags, 0644)
+	f, err := os.OpenFile(svr.realPath(p.Path), osFlags, 0644)
 	if err != nil {
 		return svr.sendError(p, err)
 	}
@@ -434,17 +471,18 @@ func (p sshFxpSetstatPacket) respond(svr *Server) error {
 	b := p.Attrs.([]byte)
 	var err error
 
-	debug("setstat name \"%s\"", p.Path)
+	path := svr.realPath(p.Path)
+	debug("setstat name \"%s\"", path)
 	if (p.Flags & ssh_FILEXFER_ATTR_SIZE) != 0 {
 		var size uint64
 		if size, b, err = unmarshalUint64Safe(b); err == nil {
-			err = os.Truncate(p.Path, int64(size))
+			err = os.Truncate(path, int64(size))
 		}
 	}
 	if (p.Flags & ssh_FILEXFER_ATTR_PERMISSIONS) != 0 {
 		var mode uint32
 		if mode, b, err = unmarshalUint32Safe(b); err == nil {
-			err = os.Chmod(p.Path, os.FileMode(mode))
+			err = os.Chmod(path, os.FileMode(mode))
 		}
 	}
 	if (p.Flags & ssh_FILEXFER_ATTR_ACMODTIME) != 0 {
@@ -455,7 +493,7 @@ func (p sshFxpSetstatPacket) respond(svr *Server) error {
 		} else {
 			atimeT := time.Unix(int64(atime), 0)
 			mtimeT := time.Unix(int64(mtime), 0)
-			err = os.Chtimes(p.Path, atimeT, mtimeT)
+			err = os.Chtimes(path, atimeT, mtimeT)
 		}
 	}
 	if (p.Flags & ssh_FILEXFER_ATTR_UIDGID) != 0 {
@@ -464,7 +502,7 @@ func (p sshFxpSetstatPacket) respond(svr *Server) error {
 		if uid, b, err = unmarshalUint32Safe(b); err != nil {
 		} else if gid, b, err = unmarshalUint32Safe(b); err != nil {
 		} else {
-			err = os.Chown(p.Path, int(uid), int(gid))
+			err = os.Chown(path, int(uid), int(gid))
 		}
 	}
 

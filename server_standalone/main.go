@@ -18,12 +18,14 @@ func main() {
 		readOnly    bool
 		debugStderr bool
 		debugLevel  string
+		chroot      string
 		options     []sftp.ServerOption
 	)
 
 	flag.BoolVar(&readOnly, "R", false, "read-only server")
 	flag.BoolVar(&debugStderr, "e", false, "debug to stderr")
 	flag.StringVar(&debugLevel, "l", "none", "debug level (ignored)")
+	flag.StringVar(&chroot, "r", "", "chroot directory")
 	flag.Parse()
 
 	debugStream := ioutil.Discard
@@ -34,6 +36,10 @@ func main() {
 
 	if readOnly {
 		options = append(options, sftp.ReadOnly())
+	}
+
+	if chroot != "" {
+		options = append(options, sftp.Chroot(chroot))
 	}
 
 	svr, _ := sftp.NewServer(
